@@ -128,138 +128,100 @@ One-line description.
 3.  **Copy**: Re-clone & overwrite (warn first).
 4.  Compare new version (Warn if MAJOR change). Update parent repo pointer.
 
-### 3. Extract New Module (from Jam) — **End-to-End Pipeline**
+### 3. Extract New Module (from Jam) — **Hardlink Mirror Pipeline**
 
-**Goal**: Transform a local folder in a project into a reusable submodule hosted in the organization.
+**Goal**: Transform scattered files in a project into a clean module while keeping them in their original locations for live-sync development.
 
 **Pipeline**:
-1.  **Analyze**: Identify source folder and intended category.
-2.  **Prepare**: Ensure `README.md` and structure are correct.
-3.  **Publish**: Create a **new repository** in `godot-shared-modules`.
-4.  **Link**: Add this new repo as a submodule to `my_godot_toolbox`.
-5.  **Replace**: Replace the original folder in the project with the new submodule.
+1.  **Identify**: List all candidate files (scripts, scenes, assets) and their intended subdirectory in the module.
+2.  **Consolidate (Mirror)**: Create a mirror folder in `.toolbox_sync/<module_name>/`.
+3.  **Hardlink**: Create hard links from the scattered files into the mirror folder.
+4.  **Protect Godot**: Add a `.gdignore` file to `.toolbox_sync/` to prevent duplicate asset importing.
+5.  **Metadata**: Generate `README.md` and standard module structure inside the mirror.
+6.  **Publish**:
+    - Push the mirror folder (real files) to `godot-shared-modules`.
+    - Register in `my_godot_toolbox`.
+    - Replace the `.toolbox_sync/<module_name>` folder with a Git submodule.
 
 **Steps for Agent:**
 
-1.  **Identify & Validate**:
-    - Source: `<source_path>` (e.g., `systems/footstep_system`).
-    - Category: `systems`.
-    - Check for `components/`, `resources/`, etc.
-    - Generate `README.md` if missing.
+1.  **Identify & Map**:
+    - Build a mapping of `scattered_path` -> `mirror_path`.
+    - Example: `scripts/health.gd` -> `.toolbox_sync/health_system/health.gd`
 
-2.  **Create & Push to Organization**:
+2.  **Initialize Mirror Area**:
     ```powershell
-    # 1. Init local repo
-    cd <source_path>
+    $mirrorRoot = ".toolbox_sync"
+    mkdir -p "$mirrorRoot/<module_name>"
+
+    # Standard Godot ignore for the whole sync area
+    if (-not (Test-Path "$mirrorRoot/.gdignore")) {
+        New-Item "$mirrorRoot/.gdignore" -Value "*" | Out-Null
+    }
+
+    # Ensure project git ignores the sync area
+    if (Test-Path ".gitignore") {
+        $content = Get-Content ".gitignore"
+        if ($content -notcontains ".toolbox_sync/") {
+            Add-Content ".gitignore" "`n.toolbox_sync/"
+        }
+    }
+    ```
+
+3.  **Create Hardlinks**:
+    The agent must create hardlinks from the scattered project files into the mirror folder.
+
+    **Windows (PowerShell)**:
+    ```powershell
+    New-Item -ItemType HardLink -Path <mirror_path> -Target <scattered_path> -Force
+    ```
+
+    **Windows (CMD)**:
+    ```cmd
+    mklink /H <mirror_path> <scattered_path>
+    ```
+
+    **Linux / macOS / Unix**:
+    ```bash
+    ln <scattered_path> <mirror_path>
+    ```
+
+    *Note: Hardlinks must reside on the same partition/volume as the source files.*
+
+4.  **Publish to Organization**:
+    ```powershell
+    # 1. Init local repo in the mirror folder
+    cd .toolbox_sync/<module_name>
     git init
     git add .
     git commit -m "Init module v1.0.0"
 
     # 2. PROVISION REMOTE (Hardcoded Organization)
     $org = "godot-shared-modules"
-    $repoName = "<module_name>" # e.g. footstep_system
+    $repoName = "<module_name>"
     $fullName = "$org/$repoName"
 
-    # Check existence
-    if (gh repo view $fullName 2>$null) {
-        Write-Warning "Repo $fullName already exists! Aborting to prevent overwrite."
-        exit 1
-    }
-
-    # Pre-flight: Check permissions & configure git helper to avoid credential prompts
-    if (-not (gh auth status 2>&1 | Select-String "Logged in to github.com")) {
-        Write-Error "Not logged in to GitHub CLI! Run 'gh auth login'."
-        exit 1
-    }
-
-    # Configure git to use gh as credential helper (Prevents prompt hang on push)
     gh auth setup-git
-
-    # Create in Org
-    Write-Host "Creating $fullName..."
-    try {
-        # Using --source=. automatically pushes, so we need credentials ready
-        gh repo create $fullName --public --source=. --remote=origin
-    } catch {
-        Write-Error "Failed to create repo in $org. Check permissions or name availability."
-        exit 1
-    }
-
-    # Push main branch (if gh didn't fully push)
+    gh repo create $fullName --public --source=. --remote=origin
     git push -u origin main
     ```
 
-3.  **Register in Toolbox (The "Registry")**:
+5.  **Register in Toolbox (The "Registry")**:
     ```powershell
-    # 3. Add to Toolbox
-    # STRATEGY: Try local path first. If missing/restricted, CLONE to temp.
-    # AUTO-BOOTSTRAP: If remote toolbox missing, create it.
-
     $localToolbox = "d:\Project\Games\my_godot_toolbox"
-    $tempToolbox = "temp_toolbox_$(Get-Random)"
-    $isTemp = $false
-
-    if (Test-Path $localToolbox) {
-        Write-Host "Using local toolbox at $localToolbox"
-        cd $localToolbox
-    } else {
-        Write-Host "Local toolbox not found. checking remote..."
-        $user = (gh api user --jq .login)
-        $toolboxRepo = "$user/my_godot_toolbox"
-        $toolboxUrl = "https://github.com/$user/my_godot_toolbox.git"
-
-        # 3a. Auto-create if missing on GitHub
-        if (-not (gh repo view $toolboxRepo 2>$null)) {
-            Write-Host "Toolbox repo not found. Creating $toolboxRepo..."
-            gh repo create "my_godot_toolbox" --public --add-readme
-            Write-Host "Created new Toolbox registry."
-        }
-
-        # 3b. Clone (Safe now)
-        Write-Host "Cloning to $tempToolbox..."
-        git clone $toolboxUrl $tempToolbox
-        cd $tempToolbox
-        $isTemp = $true
-
-        # 3c. Ensure Folder Structure (Idempotent)
-        $dirs = "systems", "ui", "mechanics"
-        $newStructure = $false
-        foreach ($d in $dirs) {
-            if (-not (Test-Path $d)) {
-                mkdir $d | Out-Null
-                New-Item "$d/.gitkeep" -Force | Out-Null
-                $newStructure = $true
-            }
-        }
-        if ($newStructure) {
-            git add .
-            git commit -m "Init toolbox structure"
-            git push
-        }
-    }
-
-    $remoteUrl = "https://github.com/$org/$repoName.git"
-    $targetPath = "<category>/$repoName" # e.g. systems/footstep_system
-
+    cd $localToolbox
+    $remoteUrl = "https://github.com/godot-shared-modules/$repoName.git"
     mkdir -p <category>
-    git submodule add $remoteUrl $targetPath
+    git submodule add $remoteUrl <category>/$repoName
     git add .
     git commit -m "Register module: $fullName"
     git push
-
-    if ($isTemp) {
-        cd ..
-        Remove-Item -Recurse -Force $tempToolbox
-    }
     ```
 
-4.  **Integrate back to Project**:
-    ```powershell
-    # 4. Replace local folder with Submodule
-    cd <original_project_root>
-    Remove-Item -Recurse -Force <source_path>
-    git submodule add $remoteUrl <source_path>
-    ```
+6.  **Consolidate Sync**:
+    - The mirror folder is now a separate Git repo (or submodule).
+    - You can edit files in the main Godot project, and they change in the mirror instantly.
+    - You can `git push` from the mirror to update the shared module.
 
 ### 4. Sync Development (Jam)
 **"Fix bug in inventory"**
